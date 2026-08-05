@@ -1,0 +1,182 @@
+# Builds sqlite once per platform and publishes the packages.
+#
+# Six native legs each produce one addon and publish their own platform package; a seventh
+# leg builds the wasm and publishes the universal package LAST, because that one names the
+# platform versions in its optionalDependencies and must not appear before they exist.
+#
+# The runner set mirrors the one the desktop release already uses: macos-latest covers both
+# arm64 and x64 (one Xcode targets both), and windows/linux each have a native arm runner.
+#
+# The shape is copied from knockdata/duckdb, where a cold build is 15-40 minutes per platform.
+# SQLite is one amalgamated C file, so a leg here is a couple of minutes — but the same
+# idempotence still matters: a rerun must never republish, and never burn a revision.
+name: release
+
+# Publishing uses npm trusted publishing (OIDC) when the package has a trusted publisher
+# configured on npmjs.com: the workflow proves its own identity, so no secret is involved and
+# npm attaches provenance automatically. NPM_TOKEN stays as a fallback for names that are not
+# configured yet — a token cannot create a package it was not granted, and a brand new name
+# could never have been granted, which is the bootstrap scripts/placeholders.mjs solves.
+#
+# id-token: write is what lets the runner mint the OIDC token; without it npm silently falls
+# back to the secret.
+permissions:
+  contents: read
+  id-token: write
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  # Everything cheap happens here, before a single runner starts compiling: check the tag, check
+  # how publishing will authenticate, and work out which packages this release still owes. The
+  # last one drives the matrix below, so a platform already on npm never starts a build at all,
+  # and a rerun of a half-published release finishes it rather than being told npm already has
+  # that version.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      platforms: ${{ steps.plan.outputs.platforms }}
+      universal: ${{ steps.plan.outputs.universal }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # trusted publishing needs npm 11.5.1+; node 22 still ships npm 10
+      - run: npm install -g npm@latest
+        shell: bash
+
+      - name: The tag must match package.json
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v$version" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package.json $version" >&2
+            exit 1
+          fi
+          echo "releasing $version (sqlite v${version%%-*})"
+
+      # Every leg compiles before it reaches npm publish, so a token problem is worth naming
+      # in three seconds rather than six times over.
+      #
+      # npm answers an unauthorised publish with 404 rather than 403, so a permission problem
+      # reads as "package not found" and sends you looking in the wrong place. Authenticating
+      # is not enough either: a granular token limited to "only select packages" cannot CREATE
+      # a package, because one that does not exist yet could never have been selected — and
+      # every platform package is new on a first release. Hence the scope probe, which is a
+      # warning rather than a failure so a quirk of the endpoint can never block a release.
+      - name: Check how this run will authenticate
+        run: |
+          if [ -z "${NODE_AUTH_TOKEN}" ]; then
+            echo "no NPM_TOKEN: publishing via trusted publishing (OIDC)"
+          else
+            npm whoami || {
+              echo "the NPM_TOKEN secret is not a valid npm token" >&2
+              exit 1
+            }
+            npm access list packages @knockdata >/dev/null 2>&1 || {
+              echo "::warning::the token authenticates but has no @knockdata scope permission." \
+                   "Publishing a NEW package will fail with a misleading 404." \
+                   "Give it read/write on the whole @knockdata scope, not 'only select packages'," \
+                   "or configure trusted publishing and drop the token."
+            }
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: What this release still owes
+        id: plan
+        run: node scripts/plan.mjs
+
+  # The matrix is whatever plan.mjs said is still missing, so the six platforms of a
+  # half-published release resolve to an empty list and this job is skipped outright.
+  native:
+    needs: version
+    if: needs.version.outputs.platforms != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.platforms) }}
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET_PLATFORM: ${{ matrix.platform }}
+      TARGET_ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # trusted publishing needs npm 11.5.1+; node 22 still ships npm 10
+      - run: npm install -g npm@latest
+        shell: bash
+
+      - name: Build the engine and the addon
+        shell: bash
+        run: bash build.sh
+
+      - name: Check it opens a database
+        shell: bash
+        run: node test/addon.js
+
+      - name: Write the platform package
+        shell: bash
+        run: node scripts/platform-package.mjs
+
+      # skips if this exact version is already on npm, so a rerun finishes a half-published
+      # release instead of failing on the packages that made it last time
+      - name: Publish
+        shell: bash
+        working-directory: dist/sqlite-${{ matrix.platform }}-${{ matrix.arch }}
+        run: node ../../scripts/publish.mjs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Last, because its optionalDependencies name the versions the jobs above just published.
+  #
+  # always() is what lets this run when `native` was skipped as having nothing to do — a skipped
+  # dependency would otherwise skip this too — while the result checks still stop it from
+  # publishing on top of a leg that actually failed.
+  universal:
+    needs: [version, native]
+    if: >-
+      always()
+      && needs.version.outputs.universal == 'true'
+      && needs.native.result != 'failure'
+      && needs.native.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # trusted publishing needs npm 11.5.1+; node 22 still ships npm 10
+      - run: npm install -g npm@latest
+        shell: bash
+      - uses: mymindstorm/setup-emsdk@v14
+
+      - name: Build the wasm
+        run: bash build.sh wasm
+
+      - name: Check it opens a database
+        run: node test/wasm.js
+
+      # npm reads binding.gyp at publish time and, seeing one, writes gypfile:true and an
+      # "install": "node-gyp rebuild" into the PUBLISHED manifest — even though "files" keeps
+      # binding.gyp out of the tarball. Every consumer then runs node-gyp against a file that
+      # is not there and the install fails. This package never builds anything on install: the
+      # addon arrives prebuilt in a platform package. Deleting it here keeps the manifest clean
+      # without an install script, which would only trade the failure for an allow-scripts
+      # warning. The native legs above have already built and published by this point, and the
+      # checkout is thrown away after.
+      - name: Keep node-gyp out of the published manifest
+        run: rm binding.gyp
+
+      - name: Publish
+        run: node scripts/publish.mjs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -1,0 +1,9 @@
+sqlite-amalgamation*
+build
+dist
+node_modules
+wasm/sqlite.js
+wasm/sqlite.wasm
+*.tgz
+.DS_Store
+.npmrc
