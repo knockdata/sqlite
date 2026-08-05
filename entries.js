@@ -9,9 +9,13 @@ export default function entriesApi(query) {
 	async function getEntries(dbPath) {
 		const rows = await query(
 			"SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY type, name")
+		// both fields carry 'table' or 'view', and both are load bearing on the consumer side:
+		// one picks the row-grid view, the other picks the icon. duckdb's entries.js returns
+		// the same pair.
 		return rows.map(row => ({
 			name: row.name,
 			label: row.name,
+			type: row.type,
 			objectKind: row.type,
 			path: `${dbPath}/${row.name}`,
 		}))

@@ -19,6 +19,8 @@ export function check(label, actual, wanted) {
 export async function checkEngine(getEntries, getEntry, source) {
 	const tables = await getEntries(source, 'sample.db', '')
 	check('tables', tables.map(row => row.name), ['users', 'active_users'])
+	// type drives the row-grid view, objectKind drives the icon — a consumer needs both
+	check('types', tables.map(row => row.type), ['table', 'view'])
 	check('kinds', tables.map(row => row.objectKind), ['table', 'view'])
 	check('paths', tables.map(row => row.path), ['sample.db/users', 'sample.db/active_users'])
 
