@@ -146,7 +146,15 @@ static napi_value column_to_napi(napi_env env, sqlite3_stmt *stmt, int col) {
     napi_value result;
 
     if (type == SQLITE_INTEGER) {
-        napi_create_int64(env, sqlite3_column_int64(stmt, col), &result);
+        // A number as long as that is lossless, a bigint past 2^53-1. Always returning a
+        // number would silently corrupt large ids; always returning a bigint would make every
+        // ordinary row awkward and unserialisable. The wasm engine draws the same line.
+        int64_t value = sqlite3_column_int64(stmt, col);
+        if (value <= 9007199254740991LL && value >= -9007199254740991LL) {
+            napi_create_int64(env, value, &result);
+        } else {
+            napi_create_bigint_int64(env, value, &result);
+        }
     } else if (type == SQLITE_FLOAT) {
         napi_create_double(env, sqlite3_column_double(stmt, col), &result);
     } else if (type == SQLITE_TEXT) {

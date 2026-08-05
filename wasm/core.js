@@ -12,6 +12,7 @@ const SQLITE_BLOB = 4
 const SQLITE_NULL = 5
 const SQLITE_ROW = 100
 const SQLITE_DONE = 101
+const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER)
 const SQLITE_OPEN_READONLY = 0x00000001
 const SQLITE_OPEN_READWRITE = 0x00000002
 const SQLITE_OPEN_CREATE = 0x00000004
@@ -106,7 +107,11 @@ export default function Core(Module) {
 			const type = Module._sqlite3_column_type(stmt, c)
 			let val = null
 			if (type === SQLITE_INTEGER) {
-				val = Module._sqlite3_column_int64(stmt, c)
+				// WASM_BIGINT hands back a bigint for every integer. Narrow it to a number while
+				// that is lossless, and keep the bigint past 2^53-1 — the same line the addon
+				// draws, so both engines return the same type for the same value.
+				const value = Module._sqlite3_column_int64(stmt, c)
+				val = value <= MAX_SAFE && value >= -MAX_SAFE ? Number(value) : value
 			}
 			else if (type === SQLITE_FLOAT) {
 				val = Module._sqlite3_column_double(stmt, c)

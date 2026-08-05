@@ -10,7 +10,6 @@
 // database the app owns) passes { readOnly: false }.
 import { createRequire } from 'node:module'
 import { addonPath, wasmPath } from './engineDir.js'
-import entriesApi from './entries.js'
 
 export default async function nodeSqlite(source, options = {}) {
 	const addon = loadAddon()
@@ -46,7 +45,6 @@ async function addonSqlite(addon, source, options) {
 			addon.close(handle)
 			await cleanup()
 		},
-		...entriesApi(query),
 	}
 }
 
@@ -84,7 +82,6 @@ async function wasmSqlite(source, options) {
 				core.close(handle)
 				await cleanup()
 			},
-			...entriesApi(query),
 		}
 	}
 	else {

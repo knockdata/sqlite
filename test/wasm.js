@@ -4,7 +4,6 @@ import fs from 'node:fs'
 import { resolve } from 'node:path'
 import SqliteModule from '../wasm/sqlite.js'
 import Core from '../wasm/core.js'
-import entriesApi from '../entries.js'
 import { fileAcquire, registerVfs } from '../wasm/vfsFile.js'
 import { wasmPath } from '../engineDir.js'
 import { check, checkEngine, samplePath } from './check.js'
@@ -23,32 +22,23 @@ if (binary) {
 	registerVfs(Module)
 	const core = Core(Module)
 
-	// the shared checks take (source) and open per call, so give them one that reuses the
-	// module and just reopens the file. It resolves the path the same way node.js does, because
-	// the VFS keys open files by the string sqlite passes to xOpen.
-	function open(source) {
+	// the same handle shape index.js returns, but wired straight to the wasm. It resolves the
+	// path the way node.js does, because the VFS keys open files by the string sqlite passes
+	// to xOpen.
+	async function open(source) {
 		const path = resolve(source)
 		fileAcquire({ path, readOnly: true })
 		const handle = core.open(path, true)
-		const query = async (sql) => core.query(handle, sql)
-		return { api: entriesApi(query), close: () => core.close(handle) }
-	}
-	async function getEntries(source, dbPath, entryPath) {
-		if (entryPath === '') {
-			const db = open(source)
-			try { return await db.api.getEntries(dbPath) } finally { db.close() }
+		return {
+			query: async (sql, params = []) => core.query(handle, sql, params),
+			exec: async (sql) => core.exec(handle, sql),
+			run: async (sql, params = []) => core.run(handle, sql, params),
+			close: async () => core.close(handle),
 		}
-		else {
-			return []
-		}
-	}
-	async function getEntry(source, entryPath, offset, limit) {
-		const db = open(source)
-		try { return await db.api.getEntry(entryPath, offset, limit) } finally { db.close() }
 	}
 
 	const before = fs.statSync(samplePath).mtimeMs
-	await checkEngine(getEntries, getEntry, samplePath)
+	await checkEngine(open, samplePath)
 	check('fixture untouched', fs.statSync(samplePath).mtimeMs, before)
 	check('no journal left behind', fs.existsSync(`${samplePath}-journal`), false)
 }

@@ -1,8 +1,8 @@
 # @knockdata/sqlite
 
-SQLite for browsing database files: list the tables and views, page through rows. One source
-builds two engines — a native N-API addon and a wasm module — and they return exactly the same
-shapes, so the same code runs in Node, in a browser and inside a single-file binary.
+SQLite as a library you can actually ship: SQL in, rows out. One source builds two engines — a
+native N-API addon and a wasm module — and they answer identically, so the same code runs in
+Node, in a browser and inside a single-file binary.
 
 ```
 native addon   1.3 MB     the fast path, one prebuilt binary per platform
@@ -11,7 +11,7 @@ wasm binary    1.2 MB     served once and cached, not inlined
 ```
 
 The companion package is [@knockdata/duckdb](https://www.npmjs.com/package/@knockdata/duckdb),
-which has the same API for duckdb files.
+built the same way for duckdb files.
 
 ## Install
 
@@ -27,38 +27,54 @@ script. If no addon matches, the wasm is used instead and everything still works
 ## Use
 
 ```js
-import { getEntries, getEntry } from '@knockdata/sqlite'
-
-await getEntries('/data/app.db', 'app.db')
-// → [{ name: 'users', label: 'users', objectKind: 'table', path: 'app.db/users' }, …]
-
-await getEntry('/data/app.db', 'users', 0, 20)
-// → { rows: [...], columns: ['id','name'], total: 3, offset: 0, limit: 20 }
-```
-
-`source` is a file path in Node, or a `File`/`ArrayBuffer`/typed array in the browser. A path is
-read in place; bytes (a database nested inside an archive) are spilled to a temp file and cleaned
-up on `close()`.
-
-**Databases are opened read only.** Not just the connection — the file descriptor too. Browsing
-a database never rewrites it, never leaves a `-journal` or `-wal` beside it, and works on a file
-the user cannot write at all. A sqlite file is flat, so listing is one level deep: anything
-below a table is empty rather than an error.
-
-Need raw SQL, or a database you own and want to write?
-
-```js
 import Sqlite from '@knockdata/sqlite'
 
-const db = await Sqlite('/data/cache.db', { readOnly: false })
-await db.exec('CREATE TABLE IF NOT EXISTS entries (key TEXT PRIMARY KEY, value TEXT)')
-await db.run('INSERT INTO entries VALUES (?, ?)', ['a', '1'])
-await db.query('SELECT * FROM entries')
+const db = await Sqlite('/data/app.db')            // a path in Node, a File or bytes in the browser
+
+await db.query('SELECT id, name FROM users LIMIT 2')
+// → [ { id: 1, name: 'Alice' }, { id: 2, name: 'Bob' } ]
+
+await db.query('SELECT name FROM users WHERE age < ?', [30])
+// → [ { name: 'Bob' } ]
+
 await db.close()
 ```
 
-Integers come back as `Number` rather than `bigint` through `getEntry`, because those rows are
-meant to be JSON. `query()` gives them to you unchanged.
+`query(sql, params)` returns rows, `exec(sql)` runs a statement for its effect, `run(sql, params)`
+returns `{ changes, lastInsertRowid }`, and `close()` releases the file. A path is read in place;
+bytes (a database nested inside an archive) are spilled to a temp file and cleaned up on `close()`.
+
+**Databases are opened read only.** Not just the connection — the file descriptor too. Reading a
+database never rewrites it, never leaves a `-journal` or `-wal` beside it, and works on a file the
+user cannot write at all. For a database you own and want to write:
+
+```js
+const cache = await Sqlite('/data/cache.db', { readOnly: false })
+await cache.exec('CREATE TABLE IF NOT EXISTS pairs (key TEXT PRIMARY KEY, value TEXT)')
+await cache.run('INSERT INTO pairs VALUES (?, ?)', ['a', '1'])
+await cache.close()
+```
+
+`TEXT` comes back as a string, `REAL` as a number, `BLOB` as an `ArrayBuffer`, `NULL` as `null`.
+An `INTEGER` is a number while that is lossless and a `bigint` past 2^53-1 — always returning a
+number would silently corrupt large ids, and always returning a bigint would make every ordinary
+row awkward and unserialisable. Both engines draw that line in the same place, which the test
+suite checks by type, not just by value.
+
+### Listing what is in a database
+
+There is no `getEntries` here, on purpose. "A table looks like this, a view looks like that, here
+is a page of rows" is an application's shape, not SQLite's — bake one app's answer into the engine
+package and the next app spends its time fighting it. Ask SQLite directly; it is three queries:
+
+```js
+await db.query("SELECT name, type FROM sqlite_master WHERE type IN ('table','view') ORDER BY name")
+await db.query('PRAGMA table_info("users")')
+await db.query('SELECT * FROM "users" LIMIT 100 OFFSET 0')
+```
+
+Identifiers cannot be bound as parameters, so a table name is interpolated — double any embedded
+quote (`name.replaceAll('"', '""')`) before you do.
 
 ### In the browser
 

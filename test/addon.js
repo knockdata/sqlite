@@ -2,7 +2,7 @@
 // falling back to the wasm — in CI this job exists to prove the addon works.
 import fs from 'node:fs'
 import { addonPath } from '../engineDir.js'
-import { getEntries, getEntry } from '../index.js'
+import Sqlite from '../index.js'
 import { check, checkEngine, samplePath } from './check.js'
 
 // A cross build produces an addon for another architecture, which this process cannot load at
@@ -20,8 +20,7 @@ if (crossBuilt) {
 else if (addon) {
 	console.log('addon:', addon, fs.statSync(addon).size, 'bytes')
 	const before = fs.statSync(samplePath).mtimeMs
-	await checkEngine(getEntries, getEntry, samplePath)
-	// read-only is the promise this package makes; a write would show up here
+	await checkEngine(Sqlite, samplePath)
 	check('fixture untouched', fs.statSync(samplePath).mtimeMs, before)
 	check('no journal left behind', fs.existsSync(`${samplePath}-journal`), false)
 	check('no wal left behind', fs.existsSync(`${samplePath}-wal`), false)

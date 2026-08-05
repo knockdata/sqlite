@@ -7,7 +7,6 @@
 // The worker is a singleton: callers open and close a db per query, but closing only drops
 // the db handle, never the module. The binary is copied into the worker rather than
 // transferred, so a second worker (after a crash) can still be given the same bytes.
-import entriesApi from './entries.js'
 
 let wasmBinary = null
 let worker = null
@@ -33,7 +32,6 @@ export default async function browserSqlite(source, options = {}) {
 		exec: (sql) => send({ type: 'exec', db: handle, sql }),
 		run: (sql, params) => send({ type: 'run', db: handle, sql, params: params ?? [] }),
 		close: () => send({ type: 'close', db: handle }),
-		...entriesApi(query),
 	}
 }
 
