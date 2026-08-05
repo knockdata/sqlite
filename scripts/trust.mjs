@@ -53,15 +53,29 @@ for (const name of names) {
 
 	if (apply) {
 		// No "is it already configured?" pre-check: `npm trust list` authenticates too, which
-		// would double the round trips. Re-running a package that is already set is cheaper.
+		// would double the round trips. Re-running a package that is already set is cheaper —
+		// the registry answers 409, which is a success for our purposes, not a failure.
+		//
+		// stderr is piped so that 409 can be recognised, and echoed straight back out so
+		// nothing is swallowed. stdout stays inherited because the browser authentication
+		// prompt is written there and has to stay live.
 		try {
-			execFileSync(npm[0], [...npm.slice(1), ...args], { cwd: root, stdio: "inherit" })
+			execFileSync(npm[0], [...npm.slice(1), ...args],
+				{ cwd: root, stdio: ["inherit", "inherit", "pipe"] })
 			console.log("configured", name)
 			done.push(name)
 		}
 		catch (error) {
-			console.error("failed", name)
-			failed.push(name)
+			const details = String(error.stderr ?? "")
+			process.stderr.write(details)
+			if (details.includes("E409") || details.includes("409 Conflict")) {
+				console.log("already configured, skipping", name)
+				done.push(name)
+			}
+			else {
+				console.error("failed", name)
+				failed.push(name)
+			}
 		}
 	}
 	else {
