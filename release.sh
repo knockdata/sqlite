@@ -19,6 +19,16 @@ cd "$(dirname "$0")"
 version=$(node -p 'require("./package.json").version')
 tag="v$version"
 
+# The platform packages carry the native addon: the main package must ask for this same
+# version of each, or npm installs the previous binary under the new version (3.51.3-r.3 shipped
+# with optionalDependencies still at r.2, so the fix it was for never reached anyone).
+stale=$(node -p 'const p = require("./package.json"); Object.entries(p.optionalDependencies).filter(([, wanted]) => wanted !== p.version).map(([name, wanted]) => `${name}@${wanted}`).join(" ")')
+if [ -n "$stale" ]; then
+	echo "optionalDependencies are not at $version: $stale" >&2
+	echo "set every @knockdata/sqlite-<platform> to $version in package.json, commit, and run again" >&2
+	exit 1
+fi
+
 if [ -z "$(git status --porcelain)" ]; then
 	echo "releasing $tag"
 else
