@@ -100,44 +100,120 @@ static napi_value napi_exec(napi_env env, napi_callback_info info) {
     return undef;
 }
 
-// bind a single param to stmt at index (1-based)
+// the bytes of a binary value: an ArrayBuffer, or any view onto one (a Buffer or another typed
+// array, a DataView, including a view onto part of a bigger buffer). -> true when val is binary
+static bool binary_bytes(napi_env env, napi_value val, void **data, size_t *length) {
+    bool found = false;
+    bool is_arraybuffer = false;
+    bool is_typedarray = false;
+    bool is_dataview = false;
+    napi_is_arraybuffer(env, val, &is_arraybuffer);
+    napi_is_typedarray(env, val, &is_typedarray);
+    napi_is_dataview(env, val, &is_dataview);
+    if (is_arraybuffer) {
+        napi_get_arraybuffer_info(env, val, data, length);
+        found = true;
+    } else if (is_typedarray) {
+        // data already points at the view's first element; the length is in elements
+        napi_typedarray_type element_type;
+        size_t elements;
+        napi_value buffer;
+        size_t offset;
+        napi_get_typedarray_info(env, val, &element_type, &elements, data, &buffer, &offset);
+        size_t element_size = 1;
+        if (element_type == napi_int16_array || element_type == napi_uint16_array) {
+            element_size = 2;
+        } else if (element_type == napi_int32_array || element_type == napi_uint32_array || element_type == napi_float32_array) {
+            element_size = 4;
+        } else if (element_type == napi_float64_array || element_type == napi_bigint64_array || element_type == napi_biguint64_array) {
+            element_size = 8;
+        }
+        *length = elements * element_size;
+        found = true;
+    } else if (is_dataview) {
+        napi_value buffer;
+        size_t offset;
+        napi_get_dataview_info(env, val, length, data, &buffer, &offset);
+        found = true;
+    }
+    return found;
+}
+
+// bind a single param to stmt at index (1-based) -> an sqlite result code. A value sqlite
+// cannot store is SQLITE_MISMATCH, never a silent NULL.
 static int bind_param(napi_env env, sqlite3_stmt *stmt, int idx, napi_value val) {
     napi_valuetype type;
     napi_typeof(env, val, &type);
+    int rc = SQLITE_MISMATCH;
+    void *data = NULL;
+    size_t length = 0;
 
     if (type == napi_null || type == napi_undefined) {
-        return sqlite3_bind_null(stmt, idx);
-    }
-    if (type == napi_number) {
+        rc = sqlite3_bind_null(stmt, idx);
+    } else if (type == napi_number) {
         double d;
         napi_get_value_double(env, val, &d);
-        // bind as int if it's whole number
-        if (d == (int64_t)d) {
-            return sqlite3_bind_int64(stmt, idx, (int64_t)d);
+        // a whole number in 64-bit range binds as an integer, anything else as a double
+        if (d >= -9223372036854775808.0 && d < 9223372036854775808.0 && d == (double)(int64_t)d) {
+            rc = sqlite3_bind_int64(stmt, idx, (int64_t)d);
+        } else {
+            rc = sqlite3_bind_double(stmt, idx, d);
         }
-        return sqlite3_bind_double(stmt, idx, d);
-    }
-    if (type == napi_boolean) {
+    } else if (type == napi_bigint) {
+        int64_t value;
+        bool lossless;
+        napi_get_value_bigint_int64(env, val, &value, &lossless);
+        rc = lossless ? sqlite3_bind_int64(stmt, idx, value) : SQLITE_RANGE;
+    } else if (type == napi_boolean) {
         bool b;
         napi_get_value_bool(env, val, &b);
-        return sqlite3_bind_int(stmt, idx, b ? 1 : 0);
-    }
-    if (type == napi_string) {
+        rc = sqlite3_bind_int(stmt, idx, b ? 1 : 0);
+    } else if (type == napi_string) {
         char *s = get_string_arg(env, val);
-        int rc = sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_bind_text(stmt, idx, s, -1, SQLITE_TRANSIENT);
         free(s);
-        return rc;
+    } else if (binary_bytes(env, val, &data, &length)) {
+        rc = sqlite3_bind_blob64(stmt, idx, length > 0 ? data : "", (sqlite3_uint64)length, SQLITE_TRANSIENT);
     }
-    // arraybuffer -> BLOB
-    bool is_buf;
-    napi_is_arraybuffer(env, val, &is_buf);
-    if (is_buf) {
-        void *data;
-        size_t len;
-        napi_get_arraybuffer_info(env, val, &data, &len);
-        return sqlite3_bind_blob(stmt, idx, data, (int)len, SQLITE_TRANSIENT);
+    return rc;
+}
+
+// bind the params array (args[2], when it is an array) -> true when every value bound; on a
+// failure the statement is finalized and a JS error names the parameter
+static bool bind_params(napi_env env, sqlite3 *db, sqlite3_stmt *stmt, size_t argc, napi_value *args) {
+    bool bound = true;
+    bool is_arr = false;
+    if (argc >= 3) {
+        napi_is_array(env, args[2], &is_arr);
     }
-    return SQLITE_OK;
+    if (is_arr) {
+        uint32_t param_count;
+        napi_get_array_length(env, args[2], &param_count);
+        // more values than placeholders: the extra ones are ignored, as they always were
+        uint32_t placeholders = (uint32_t)sqlite3_bind_parameter_count(stmt);
+        if (param_count > placeholders) {
+            param_count = placeholders;
+        }
+        for (uint32_t i = 0; i < param_count && bound; i++) {
+            napi_value param;
+            napi_get_element(env, args[2], i, &param);
+            int rc = bind_param(env, stmt, (int)(i + 1), param);
+            if (rc != SQLITE_OK) {
+                char msg[512];
+                if (rc == SQLITE_MISMATCH) {
+                    snprintf(msg, sizeof(msg), "bind parameter %u: sqlite cannot store this value (use null, a number, a bigint, a boolean, a string or binary data)", i + 1);
+                } else if (rc == SQLITE_RANGE) {
+                    snprintf(msg, sizeof(msg), "bind parameter %u: bigint outside 64 bits", i + 1);
+                } else {
+                    snprintf(msg, sizeof(msg), "bind parameter %u: %s", i + 1, sqlite3_errmsg(db));
+                }
+                sqlite3_finalize(stmt);
+                napi_throw_error(env, NULL, msg);
+                bound = false;
+            }
+        }
+    }
+    return bound;
 }
 
 // column value -> napi_value
@@ -192,27 +268,20 @@ static napi_value napi_query(napi_env env, napi_callback_info info) {
         return throw_sqlite_err(env, db, "prepare");
     }
 
-    // bind params array if provided
-    if (argc >= 3) {
-        bool is_arr;
-        napi_is_array(env, args[2], &is_arr);
-        if (is_arr) {
-            uint32_t param_count;
-            napi_get_array_length(env, args[2], &param_count);
-            for (uint32_t i = 0; i < param_count; i++) {
-                napi_value param;
-                napi_get_element(env, args[2], i, &param);
-                bind_param(env, stmt, (int)(i + 1), param);
-            }
-        }
+    if (bind_params(env, db, stmt, argc, args) == false) {
+        return NULL;
     }
 
     int col_count = sqlite3_column_count(stmt);
 
-    // collect column names
-    const char **col_names = malloc(col_count * sizeof(char *));
+    // The column names, copied into JS strings now. sqlite3_column_name's pointers last only
+    // until the statement is prepared again, and sqlite re-prepares on the first step when a
+    // bound value changes the plan (LIKE ?, GLOB ?, LIMIT ?): keeping the pointers past that
+    // step read freed memory and garbled every key.
+    napi_value *col_names = malloc((col_count > 0 ? col_count : 1) * sizeof(napi_value));
     for (int i = 0; i < col_count; i++) {
-        col_names[i] = sqlite3_column_name(stmt, i);
+        const char *name = sqlite3_column_name(stmt, i);
+        napi_create_string_utf8(env, name ? name : "", NAPI_AUTO_LENGTH, &col_names[i]);
     }
 
     napi_value rows;
@@ -225,7 +294,7 @@ static napi_value napi_query(napi_env env, napi_callback_info info) {
 
         for (int c = 0; c < col_count; c++) {
             napi_value col_val = column_to_napi(env, stmt, c);
-            napi_set_named_property(env, row, col_names[c], col_val);
+            napi_set_property(env, row, col_names[c], col_val);
         }
 
         napi_set_element(env, rows, row_idx++, row);
@@ -260,18 +329,8 @@ static napi_value napi_run(napi_env env, napi_callback_info info) {
         return throw_sqlite_err(env, db, "prepare");
     }
 
-    if (argc >= 3) {
-        bool is_arr;
-        napi_is_array(env, args[2], &is_arr);
-        if (is_arr) {
-            uint32_t param_count;
-            napi_get_array_length(env, args[2], &param_count);
-            for (uint32_t i = 0; i < param_count; i++) {
-                napi_value param;
-                napi_get_element(env, args[2], i, &param);
-                bind_param(env, stmt, (int)(i + 1), param);
-            }
-        }
+    if (bind_params(env, db, stmt, argc, args) == false) {
+        return NULL;
     }
 
     rc = sqlite3_step(stmt);

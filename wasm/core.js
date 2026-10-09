@@ -67,7 +67,15 @@ export default function Core(Module) {
 		return null
 	}
 
+	// A value sqlite cannot store throws instead of binding nothing (which read back as NULL), and
+	// a whole number past 32 bits binds as 64 bits: sqlite3_bind_int would wrap a Date.now().
+	// The same rules as the addon's bind_param.
+	const INT32_MIN = -2147483648
+	const INT32_MAX = 2147483647
+
 	function bindParams(stmt, params) {
+		// more values than placeholders: sqlite answers SQLITE_RANGE for the extra ones, which
+		// is ignored, as it always was
 		for (let i = 0; i < params.length; i++) {
 			const v = params[i]
 			const idx = i + 1
@@ -75,27 +83,44 @@ export default function Core(Module) {
 				Module._sqlite3_bind_null(stmt, idx)
 			}
 			else if (typeof v === 'number') {
-				if (Number.isInteger(v)) {
+				if (Number.isInteger(v) && v >= INT32_MIN && v <= INT32_MAX) {
 					Module._sqlite3_bind_int(stmt, idx, v)
+				}
+				else if (Number.isSafeInteger(v)) {
+					Module._sqlite3_bind_int64(stmt, idx, BigInt(v))
 				}
 				else {
 					Module._sqlite3_bind_double(stmt, idx, v)
 				}
 			}
 			else if (typeof v === 'bigint') {
-				Module._sqlite3_bind_int64(stmt, idx, v)
+				if (v >= -(2n ** 63n) && v < 2n ** 63n) {
+					Module._sqlite3_bind_int64(stmt, idx, v)
+				}
+				else {
+					Module._sqlite3_finalize(stmt)
+					throw new Error(`bind parameter ${idx}: bigint outside 64 bits`)
+				}
+			}
+			else if (typeof v === 'boolean') {
+				Module._sqlite3_bind_int(stmt, idx, v ? 1 : 0)
 			}
 			else if (typeof v === 'string') {
 				const sPtr = strToPtr(v)
 				Module._sqlite3_bind_text(stmt, idx, sPtr, -1, -1) // -1 = SQLITE_TRANSIENT
 				Module._free(sPtr)
 			}
-			else if (v instanceof Uint8Array || v instanceof ArrayBuffer) {
-				const bytes = v instanceof ArrayBuffer ? new Uint8Array(v) : v
-				const bPtr = Module._malloc(bytes.byteLength)
+			else if (v instanceof ArrayBuffer || ArrayBuffer.isView(v)) {
+				// any view: a Buffer, another typed array, a DataView, part of a bigger buffer
+				const bytes = v instanceof ArrayBuffer ? new Uint8Array(v) : new Uint8Array(v.buffer, v.byteOffset, v.byteLength)
+				const bPtr = Module._malloc(Math.max(bytes.byteLength, 1))
 				Module.HEAPU8.set(bytes, bPtr)
 				Module._sqlite3_bind_blob(stmt, idx, bPtr, bytes.byteLength, -1)
 				Module._free(bPtr)
+			}
+			else {
+				Module._sqlite3_finalize(stmt)
+				throw new Error(`bind parameter ${idx}: sqlite cannot store this value (use null, a number, a bigint, a boolean, a string or binary data)`)
 			}
 		}
 	}
